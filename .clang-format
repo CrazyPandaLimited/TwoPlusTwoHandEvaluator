@@ -1,0 +1,21 @@
+---
+Language:        Cpp
+BasedOnStyle:  LLVM
+AccessModifierOffset: -4
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+BinPackParameters: false
+BraceWrapping:   
+  SplitEmptyFunction: false 
+  SplitEmptyNamespace: false
+BreakBeforeBraces: Custom
+BreakConstructorInitializersBeforeComma: true
+ColumnLimit:     150
+CompactNamespaces: true 
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+ConstructorInitializerIndentWidth: 8
+IndentCaseLabels: true
+IndentWidth:     4
+PointerAlignment: Left
+...
+
