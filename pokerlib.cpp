@@ -20,17 +20,6 @@
 #include "lookup_tables.hpp"
 #include "pokerlib.hpp"
 
-//#define FIVE_OF_A_KIND  0
-#define STRAIGHT_FLUSH  1
-#define FOUR_OF_A_KIND  2
-#define FULL_HOUSE      3
-#define FLUSH           4
-#define STRAIGHT        5
-#define THREE_OF_A_KIND 6
-#define TWO_PAIR        7
-#define ONE_PAIR        8
-#define HIGH_CARD       9
-
 #define RANK(x) ((x >> 8) & 0xF)
 
 namespace pokerlib {
@@ -56,7 +45,7 @@ int     numcards = 0;
 int     maxHR    = 0;
 int64_t maxID    = 0;
 
-inline void swap(int* wk, int i, int j) {
+static inline void swap(int* wk, int i, int j) {
     if (wk[i] < wk[j]) {
         wk[i] ^= wk[j];
         wk[j] ^= wk[i];
@@ -65,7 +54,7 @@ inline void swap(int* wk, int i, int j) {
 }
 
 // Sort Using XOR. Network for N=7, using Bose-Nelson Algorithm: Thanks to the thread!
-inline void bose_nelson_sort_7(int* wk) {
+static inline void bose_nelson_sort_7(int* wk) {
     swap(wk, 0, 4);
     swap(wk, 1, 5);
     swap(wk, 2, 6);
@@ -110,7 +99,7 @@ int64_t make_id(int64_t IDin, int newcard) {
 
     for (numcards = 0; wk[numcards]; numcards++) {
         // need to see if suit is significant
-        suitcount[wk[numcards] & 0xf]++;
+        suitcount[wk[numcards] & 0xF]++;
         // and rank to be sure we don't have 4!
         rankcount[(wk[numcards] >> 4) & 0xF]++;
         if (numcards) {
@@ -340,11 +329,7 @@ void init() {
 
     clock_t timer = clock(); // remember when I started
 
-    // Store the count of each type of hand (One Pair, Flush, etc)
-    int handTypeSum[10];
-
     // Clear our arrays
-    memset(handTypeSum, 0, sizeof(handTypeSum));
     memset(IDs, 0, sizeof(IDs));
     memset(HR, 0, sizeof(HR));
 
@@ -411,43 +396,6 @@ void init() {
     timer = clock() - timer; // end the timer
 
     _PDEBUG("Training seconds = %.2f", (float)timer / CLOCKS_PER_SEC);
-
-    timer = clock(); // now get current time for Testing!
-
-    // another algorithm right off the thread
-
-    int c0, c1, c2, c3, c4, c5, c6;
-    int u0, u1, u2, u3, u4, u5;
-
-    for (c0 = 1; c0 < 53; c0++) {
-        u0 = HR[53 + c0];
-        for (c1 = c0 + 1; c1 < 53; c1++) {
-            u1 = HR[u0 + c1];
-            for (c2 = c1 + 1; c2 < 53; c2++) {
-                u2 = HR[u1 + c2];
-                for (c3 = c2 + 1; c3 < 53; c3++) {
-                    u3 = HR[u2 + c3];
-                    for (c4 = c3 + 1; c4 < 53; c4++) {
-                        u4 = HR[u3 + c4];
-                        for (c5 = c4 + 1; c5 < 53; c5++) {
-                            u5 = HR[u4 + c5];
-                            for (c6 = c5 + 1; c6 < 53; c6++) {
-                                handTypeSum[HR[u5 + c6] >> 12]++;
-                                count++;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    timer = clock() - timer; // get the time in this
-
-    for (int i = 0; i <= 9; i++) // display the results
-        _PDEBUG("%16s = %d", HandRanks[i], handTypeSum[i]);
-
-    _PDEBUG("Total Hands = %d", count);
 }
 
 //   This routine initializes the deck.  A deck of cards is
@@ -493,53 +441,26 @@ void shuffle_deck(int* deck, int size) {
     std::random_shuffle(deck, deck + size);
 }
 
-// Prints poker hand, cards should be a pointer to an array
-// of integers each with value between 1 and 52 inclusive.
-std::string dump_cards(int* hand, int size) {
-    static const char* ranks = "23456789TJQKA";
-    static const char* suits = "cdhs";
-    std::string result;
-    result.reserve(size*2);
-    for (int i = 0; i < size; i++, hand++) {
-        _PDEBUG("card: %d - rank: %d suit: %d", *hand, *hand % 13, *hand / 13);
-        result.push_back(ranks[(int)(*hand % 13)]);
-        result.push_back(suits[(int)(*hand / 13)]);
-    }
-    return result;
-}
-
 std::string print_hand(int* hand, int size) {
     static const char* ranks = "23456789TJQKA";
     std::string result;
     result.reserve(size*2);
-    for (int i = 0; i < size; i++, hand++) {
+    for (int i = 0; i < size; i++) {
         char suit;
-        if (*hand & 0x8000)
+        if (hand[i] & 0x8000)
             suit = 'c';
-        else if (*hand & 0x4000)
+        else if (hand[i] & 0x4000)
             suit = 'd';
-        else if (*hand & 0x2000)
+        else if (hand[i] & 0x2000)
             suit = 'h';
         else
             suit = 's';
 
-        _PDEBUG("card: %X - rank: %d suit: %d", *hand, ranks[(*hand >> 8) & 0xF], suit);
-        result.push_back(ranks[(*hand >> 8) & 0xF]);
+        _PDEBUG("card: %X - rank: %d suit: %d", hand[i], ranks[(hand[i] >> 8) & 0xF], suit);
+        result.push_back(ranks[(hand[i] >> 8) & 0xF]);
         result.push_back(suit);
     }
     return result;
-}
-
-int hand_rank(short val) {
-    if (val > 6185) return HIGH_CARD; // 1277 high card
-    if (val > 3325) return ONE_PAIR; // 2860 one pair
-    if (val > 2467) return TWO_PAIR; // 858 two pair
-    if (val > 1609) return THREE_OF_A_KIND; // 858 three-kind
-    if (val > 1599) return STRAIGHT; // 10 straights
-    if (val > 322) return FLUSH; // 1277 flushes
-    if (val > 166) return FULL_HOUSE; // 156 full house
-    if (val > 10) return FOUR_OF_A_KIND; // 156 four-kind
-    return STRAIGHT_FLUSH; // 10 straight-flushes
 }
 
 unsigned find_fast(unsigned u) {
@@ -593,15 +514,15 @@ short eval_7hand(int* hand) {
 
 // Lookup of a 7-card poker hand, cards should be a pointer to an array
 // of 7 integers each with value between 1 and 52 inclusive.
-int lookup_7hand(int* cards) {
+int lookup(const int* cards) {
     int p;
-    p = HR[1 + 53 + *cards++];
-    p = HR[1 + p + *cards++];
-    p = HR[1 + p + *cards++];
-    p = HR[1 + p + *cards++];
-    p = HR[1 + p + *cards++];
-    p = HR[1 + p + *cards++];
-    p = HR[1 + p + *cards++];
+    p = HR[53 + cards[0]];
+    p = HR[p + cards[1]];
+    p = HR[p + cards[2]];
+    p = HR[p + cards[3]];
+    p = HR[p + cards[4]];
+    p = HR[p + cards[5]];
+    p = HR[p + cards[6]];
     return p;
 }
 
