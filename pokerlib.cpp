@@ -10,15 +10,29 @@
 //
 // Cactus Kev Poker Hand Evaluator
 // http://suffe.cool/poker/evaluator.html
+//
+// John M. Gamble Sorting Networks
+// http://pages.ripco.net/~jgamble/nw.html
 
+
+#include <set>
+#include <vector>
 #include <ctime>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <algorithm>
 #include <type_traits>
+#include <atomic>
+
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "lookup_tables.hpp"
 #include "pokerlib.hpp"
+
+#include <tbb/tbb.h>
 
 #define RANK(x) ((x >> 8) & 0xF)
 
@@ -27,63 +41,18 @@ namespace pokerlib {
 extern unsigned short hash_adjust[];
 extern unsigned short hash_values[];
 
-const char HandRanks[][16] = {
-    "Bad",             // 0
-    "High Card",       // 1
-    "Pair",            // 2
-    "Two Pair",        // 3
-    "Three of a Kind", // 4
-    "Straight",        // 5
-    "Flush",           // 6
-    "Full House",      // 7
-    "Four of a Kind",  // 8
-    "Straight Flush"   // 9
-};
-
-int     numIDs   = 1;
-int     numcards = 0;
-int     maxHR    = 0;
-int64_t maxID    = 0;
-
-static inline void swap(int* wk, int i, int j) {
-    if (wk[i] < wk[j]) {
-        wk[i] ^= wk[j];
-        wk[j] ^= wk[i];
-        wk[i] ^= wk[j];
-    }
-}
-
-// Sort Using XOR. Network for N=7, using Bose-Nelson Algorithm: Thanks to the thread!
-static inline void bose_nelson_sort_7(int* wk) {
-    swap(wk, 0, 4);
-    swap(wk, 1, 5);
-    swap(wk, 2, 6);
-    swap(wk, 0, 2);
-    swap(wk, 1, 3);
-    swap(wk, 4, 6);
-    swap(wk, 2, 4);
-    swap(wk, 3, 5);
-    swap(wk, 0, 1);
-    swap(wk, 2, 3);
-    swap(wk, 4, 5);
-    swap(wk, 1, 4);
-    swap(wk, 3, 6);
-    swap(wk, 1, 2);
-    swap(wk, 3, 4);
-    swap(wk, 5, 6);
+const int* get_table() {
+    return reinterpret_cast<const int*>(ranks_map.data());
 }
 
 // returns a 64-bit hand ID, for up to 8 cards, stored 1 per byte.
-int64_t make_id(int64_t IDin, int newcard) {
-    int suitcount[4 + 1];
-    int rankcount[13 + 1];
-    int wk[8]; // intentially keeping one as a 0 end
+int64_t make_id(int64_t IDin, int newcard, int &numcards, bool with_joker, const Debug& debug) {
+    int suitcount[SUITS_COUNT + 1] = {};
+    int rankcount[JOKER_RANKS_COUNT + 1] = {};
+    int wk[8] = {}; // intentially keeping one as a 0 end
     int cardnum;
     int getout = 0;
-
-    memset(wk, 0, sizeof(wk));
-    memset(rankcount, 0, sizeof(rankcount));
-    memset(suitcount, 0, sizeof(suitcount));
+    int jokercount = 0;
 
     // can't have more than 6 cards!
     for (cardnum = 0; cardnum < 6; cardnum++) {
@@ -98,10 +67,19 @@ int64_t make_id(int64_t IDin, int newcard) {
     wk[0] = (((newcard >> 2) + 1) << 4) + (newcard & 3) + 1;
 
     for (numcards = 0; wk[numcards]; numcards++) {
+        int suit = wk[numcards] & 0xF;
+        int rank = wk[numcards] >> 4 & 0xF;
+
+        if (rank == 14) {
+            // is a joker
+            jokercount++;
+        }
+
         // need to see if suit is significant
-        suitcount[wk[numcards] & 0xF]++;
+        suitcount[suit]++;
         // and rank to be sure we don't have 4!
-        rankcount[(wk[numcards] >> 4) & 0xF]++;
+        rankcount[rank]++;
+
         if (numcards) {
             // can't have the same card twice
             // if so need to get out after counting numcards
@@ -109,17 +87,18 @@ int64_t make_id(int64_t IDin, int newcard) {
                 getout = 1;
         }
     }
+    // duplicated another card (ignore this one)
     if (getout)
-        return 0; // duplicated another card (ignore this one)
+        return 0;
 
-    // for suit to be significant, need to have n-2 of same suit
-    int needsuited = numcards - 2;
     if (numcards > 4) {
-        for (int rank = 1; rank < 14; rank++) {
+        for (int rank = 1; rank < RANKS_COUNT + 1 + (int)with_joker; rank++) {
             // if I have more than 4 of a rank then I shouldn't do this one!!
             // can't have more than 4 of a rank so return an ID that can't be!
-            if (rankcount[rank] > 4)
+            if (rankcount[rank] > 4) {
+                //_PDEBUG("r:%d c:%d", rank, rankcount[rank]);
                 return 0;
+            }
         }
     }
 
@@ -127,19 +106,31 @@ int64_t make_id(int64_t IDin, int newcard) {
     // 2s = 0x21, 3s = 0x31,.... Kc = 0xD4, Ac = 0xE4
     // This allows me to sort in Rank then Suit order
 
+    // for suit to be significant, need to have n-2 of same suit
+    int needsuited = numcards - 2;
+
     // if we don't have at least 2 cards of the same suit for 4,
     // we make this card suit 0.
     if (needsuited > 1) {
         for (cardnum = 0; cardnum < numcards; cardnum++) { // for each card
-            if (suitcount[wk[cardnum] & 0xF] < needsuited) {
+            if ((suitcount[wk[cardnum] & 0xF] + jokercount < needsuited)
+                    || ((wk[cardnum] >> 4 & 0xF) == 14)
+                    || jokercount == 4) {
                 // check suitcount to the number I need to have suits significant
                 // if not enough - 0 out the suit - now this suit would be a 0 vs 1-4
+                // SA: I don't need suits if I have 4 jokers or if this card is a joker
                 wk[cardnum] &= 0xF0;
             }
         }
     }
 
     bose_nelson_sort_7(wk);
+
+    if(debug.on && numcards == debug.cardnum) {
+        if(debug.id_callback(wk, numcards, jokercount)) {
+            return -1;
+        }
+    }
 
     // long winded way to put the pieces into a int64_t cards in bytes --66554433221100
     // the resulting ID is a 64 bit value with each card represented by 8 bits.
@@ -153,7 +144,7 @@ int64_t make_id(int64_t IDin, int newcard) {
 }
 
 // this inserts a hand ID into the IDs array.
-int save_id(int64_t ID) {
+int save_id(int64_t ID, std::vector<int64_t>& IDs, int64_t& maxID, int& numIDs) {
     if (ID == 0) {
         // don't use up a record for a 0!
         return 0;
@@ -193,11 +184,28 @@ int save_id(int64_t ID) {
     return high;
 }
 
+int eval(int* wk, int numevalcards, int numcards) {
+    switch (numevalcards) {
+        case 5:
+            return eval_5hand(wk);
+        case 6:
+            return eval_6hand(wk);
+        case 7:
+            return eval_7hand(wk);
+        default:
+            throw Error("Problem with numcards = " + std::to_string(numcards));
+    }
+}
+
 // Converts a 64bit handID to an absolute ranking.
 // I guess I have some explaining to do here...
 // I used the Cactus Kevs Eval http://suffe.cool/poker/evaluator.html
 // I Love the pokersource for speed, but I needed to do some tweaking to get it my way and Cactus Kevs stuff was easy to tweak ;-)
-int do_eval(int64_t IDin) {
+int do_eval(int64_t IDin, int numcards, const Debug& debug) {
+    if (IDin == 0) {
+        return 0;
+    }
+
     int result = 0;
     int cardnum;
     int wkcard;
@@ -211,135 +219,255 @@ int do_eval(int64_t IDin) {
     // changed as per Ray Wotton's comment at http://archives1.twoplustwo.com/showflat.php?Cat=0&Number=8513906&page=0&fpart=18&vc=1
     int suititerator = 1;
     int holdrank;
-    int wk[8]; // "work" intentially keeping one as a 0 end
-    int holdcards[8];
     int numevalcards = 0;
+    int wk[8] = {}; // "work" intentially keeping one as a 0 end
+    int holdcards[8] = {};
 
-    // See Cactus Kevs page for explainations for this type of stuff...
-    const int primes[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41};
+    // convert all 7 cards (0s are ok)
+    for (cardnum = 0; cardnum < 7; cardnum++) {
+        holdcards[cardnum] = (int)((IDin >> (8 * cardnum)) & 0xFF);
 
-    memset(wk, 0, sizeof(wk));
-    memset(holdcards, 0, sizeof(holdcards));
+        // once I hit a 0 I know I am done
+        if (holdcards[cardnum] == 0)
+            break;
 
-    // if I have a good ID then do it...
-    if (IDin) {
-        // convert all 7 cards (0s are ok)
-        for (cardnum = 0; cardnum < 7; cardnum++) {
-            holdcards[cardnum] = (int)((IDin >> (8 * cardnum)) & 0xFF);
+        numevalcards++;
 
-            // once I hit a 0 I know I am done
-            if (holdcards[cardnum] == 0)
-                break;
-            numevalcards++;
-
-            // if not 0 then count the card
-            if ((suit = holdcards[cardnum] & 0xF)) {
-                // find out what suit (if any) was significant and remember it
-                mainsuit = suit;
-            }
+        // if not 0 then count the card
+        if ((suit = holdcards[cardnum] & 0xF)) {
+            // find out what suit (if any) was significant and remember it
+            mainsuit = suit;
         }
-
-        for (cardnum = 0; cardnum < numevalcards; cardnum++) {
-            // just have numcards...
-            wkcard = holdcards[cardnum];
-
-            // convert to cactus kevs way!!
-            // http://suffe.cool/poker/evaluator.html
-            //   +--------+--------+--------+--------+
-            //   |xxxbbbbb|bbbbbbbb|cdhsrrrr|xxpppppp|
-            //   +--------+--------+--------+--------+
-            //   p = prime number of rank (deuce=2,trey=3,four=5,five=7,...,ace=41)
-            //   r = rank of card (deuce=0,trey=1,four=2,five=3,...,ace=12)
-            //   cdhs = suit of card
-            //   b = bit turned on depending on rank of card
-
-            rank = (wkcard >> 4) - 1; // my rank is top 4 bits 1-13 so convert
-            suit = wkcard & 0xF;      // my suit is bottom 4 bits 1-4, order is different, but who cares?
-            if (suit == 0) {
-                // if suit wasn't significant though...
-                suit = suititerator++; // Cactus Kev needs a suit!
-                if (suititerator == 5) // loop through available suits
-                    suititerator = 1;
-                if (suit == mainsuit) {    // if it was the sigificant suit...  Don't want extras!!
-                    suit = suititerator++; // skip it
-                    if (suititerator == 5) // roll 1-4
-                        suititerator = 1;
-                }
-            }
-            // now make Cactus Kev's Card
-            wk[cardnum] = primes[rank] | (rank << 8) | (1 << (suit + 11)) | (1 << (16 + rank));
-        }
-
-        // James Devlin: replaced all calls to Cactus Kev's eval_5cards with calls to Senzee's improved eval_5hand_fast
-        // run Cactus Kev's routines
-        switch (numevalcards) {
-            case 5:
-                holdrank = eval_5hand_fast(wk[0], wk[1], wk[2], wk[3], wk[4]);
-                break;
-            case 6:
-                // if 6 cards I would like to find Result for them
-                // Cactus Key is 1 = highest - 7362 lowest
-                // I need to get the min for the permutations
-                holdrank = eval_5hand_fast(wk[0], wk[1], wk[2], wk[3], wk[4]);
-                holdrank = std::min(holdrank, eval_5hand_fast(wk[0], wk[1], wk[2], wk[3], wk[5]));
-                holdrank = std::min(holdrank, eval_5hand_fast(wk[0], wk[1], wk[2], wk[4], wk[5]));
-                holdrank = std::min(holdrank, eval_5hand_fast(wk[0], wk[1], wk[3], wk[4], wk[5]));
-                holdrank = std::min(holdrank, eval_5hand_fast(wk[0], wk[2], wk[3], wk[4], wk[5]));
-                holdrank = std::min(holdrank, eval_5hand_fast(wk[1], wk[2], wk[3], wk[4], wk[5]));
-                break;
-            case 7:
-                holdrank = eval_7hand(wk);
-                break;
-            default:
-                // problem!!  shouldn't hit this...
-                _PDEBUG("    Problem with numcards = %d!!", numcards);
-                break;
-        }
-
-        // I would like to change the format of Catus Kev's ret value to:
-        // hhhhrrrrrrrrrrrr   hhhh = 1 high card -> 9 straight flush
-        //                    r..r = rank within the above	1 to max of 2861
-        result = 7463 - holdrank; // now the worst hand = 1
-
-        if (result < 1278)
-            result = result - 0 + 4096 * 1; // 1277 high card
-        else if (result < 4138)
-            result = result - 1277 + 4096 * 2; // 2860 one pair
-        else if (result < 4996)
-            result = result - 4137 + 4096 * 3; // 858 two pair
-        else if (result < 5854)
-            result = result - 4995 + 4096 * 4; // 858 three-kind
-        else if (result < 5864)
-            result = result - 5853 + 4096 * 5; // 10 straights
-        else if (result < 7141)
-            result = result - 5863 + 4096 * 6; // 1277 flushes
-        else if (result < 7297)
-            result = result - 7140 + 4096 * 7; // 156 full house
-        else if (result < 7453)
-            result = result - 7296 + 4096 * 8; // 156 four-kind
-        else
-            result = result - 7452 + 4096 * 9; // 10 str.flushes
     }
-    return result; // now a handrank that I like
+
+    for (cardnum = 0; cardnum < numevalcards; cardnum++) {
+        // just have numcards...
+        wkcard = holdcards[cardnum];
+
+        // convert to cactus kevs way!!
+        // http://suffe.cool/poker/evaluator.html
+        //   +--------+--------+--------+--------+
+        //   |xxxbbbbb|bbbbbbbb|cdhsrrrr|xxpppppp|
+        //   +--------+--------+--------+--------+
+        //   p = prime number of rank (deuce=2,trey=3,four=5,five=7,...,ace=41)
+        //   r = rank of card (deuce=0,trey=1,four=2,five=3,...,ace=12)
+        //   cdhs = suit of card
+        //   b = bit turned on depending on rank of card
+
+        rank = (wkcard >> 4) - 1; // my rank is top 4 bits 1-13 so convert
+        suit = wkcard & 0xF;      // my suit is bottom 4 bits 1-4, order is different, but who cares?
+
+        if (suit == 0) {
+            // if suit wasn't significant though...
+            suit = suititerator++; // Cactus Kev needs a suit!
+            if (suititerator == 5) // loop through available suits
+                suititerator = 1;
+            if (suit == mainsuit) {    // if it was the sigificant suit...  Don't want extras!!
+                suit = suititerator++; // skip it
+                if (suititerator == 5) // roll 1-4
+                    suititerator = 1;
+            }
+        }
+
+        if(rank == RANKS_COUNT) {
+            return 1;
+        }
+
+        // now make Cactus Kev's Card
+        wk[cardnum] = primes[rank] | (rank << 8) | (1 << (suit + 11)) | (1 << (16 + rank));
+    }
+
+    bool verbose = false;
+    if(debug.on && debug.verbose && IDin == debug.id) {
+        verbose = true;
+    }
+
+    switch (numevalcards) {
+        case 5:
+            result = eval_5hand(wk);
+            break;
+        case 6:
+            result = eval_6hand(wk);
+            break;
+        case 7:
+            result = eval_7hand(wk);
+            break;
+        default:
+            throw Error("Problem with numcards = " + std::to_string(numcards));
+    }
+
+    if(debug.on && IDin == debug.id) {
+        if(!debug.eval_callback(IDin, result)) {
+            return -1;
+        }
+    }
+
+    return convert_kev_rank(result);
 }
 
-void init() {
-    int     IDslot, card = 0, count = 0;
+// Converts a 64bit handID to an absolute ranking.
+// I guess I have some explaining to do here...
+// I used the Cactus Kevs Eval http://suffe.cool/poker/evaluator.html
+// I Love the pokersource for speed, but I needed to do some tweaking to get it my way and Cactus Kevs stuff was easy to tweak ;-)
+int do_joker_eval(int64_t IDin, int numcards, const Debug& debug) {
+    if (IDin == 0) {
+        return 0;
+    }
+
+    int result = 0;
+    int cardnum;
+    int wkcard;
+    int rank;
+    int suit;
+    int mainsuit = 20; // just something that will never hit...
+
+    // ODO: need to eliminate the main suit from the iterator
+    // int suititerator = 0;
+
+    // changed as per Ray Wotton's comment at http://archives1.twoplustwo.com/showflat.php?Cat=0&Number=8513906&page=0&fpart=18&vc=1
+    int suititerator = 1;
+    int holdrank;
+    int numevalcards = 0;
+    int jokercount = 0;
+    int wk[8] = {}; // "work" intentially keeping one as a 0 end
+    int holdcards[8] = {};
+    int jokers[5] = {};
+    int rankcount[JOKER_RANKS_COUNT + 1] = {};
+
+    // convert all 7 cards (0s are ok)
+    for (cardnum = 0; cardnum < 7; cardnum++) {
+        holdcards[cardnum] = (int)((IDin >> (8 * cardnum)) & 0xFF);
+
+        // once I hit a 0 I know I am done
+        if (holdcards[cardnum] == 0)
+            break;
+
+        numevalcards++;
+
+        // if not 0 then count the card
+        if ((suit = holdcards[cardnum] & 0xF)) {
+            // find out what suit (if any) was significant and remember it
+            mainsuit = suit;
+        }
+
+        rankcount[(holdcards[cardnum] >> 4) - 1]++;
+    }
+
+    for (cardnum = 0; cardnum < numevalcards; cardnum++) {
+        // just have numcards...
+        wkcard = holdcards[cardnum];
+
+        // convert to cactus kevs way!!
+        // http://suffe.cool/poker/evaluator.html
+        //   +--------+--------+--------+--------+
+        //   |xxxbbbbb|bbbbbbbb|cdhsrrrr|xxpppppp|
+        //   +--------+--------+--------+--------+
+        //   p = prime number of rank (deuce=2,trey=3,four=5,five=7,...,ace=41)
+        //   r = rank of card (deuce=0,trey=1,four=2,five=3,...,ace=12)
+        //   cdhs = suit of card
+        //   b = bit turned on depending on rank of card
+
+        rank = (wkcard >> 4) - 1; // my rank is top 4 bits 1-13 so convert
+        suit = wkcard & 0xF;      // my suit is bottom 4 bits 1-4, order is different, but who cares?
+
+        if(rank == 13) {
+            jokers[jokercount++] = cardnum;
+            wk[cardnum] = jokercount;
+            continue;
+        }
+
+        if (suit == 0) {
+            // if suit wasn't significant though...
+            suit = suititerator++; // Cactus Kev needs a suit!
+            if (suititerator == 5) // loop through available suits
+                suititerator = 1;
+            if (suit == mainsuit) {    // if it was the sigificant suit...  Don't want extras!!
+                suit = suititerator++; // skip it
+                if (suititerator == 5) // roll 1-4
+                    suititerator = 1;
+            }
+        }
+
+        if(rank == RANKS_COUNT) {
+            return 1;
+        }
+
+        wk[cardnum] = rank*4 + suit;
+    }
+
+    int mainrank = 0;
+    int duprank = 0;
+    int dupcount = 1;
+    if(jokercount) {
+        // count pairs, triples and quads to later use in five of a kind
+        for(int i = 0; i < RANKS_COUNT; ++i) {
+            if(rankcount[i] > dupcount) {
+                dupcount = rankcount[i];
+                duprank = i;
+            }
+            if(rankcount[i]) {
+                mainrank = i;
+            }
+        }
+    }
+
+    if (dupcount + jokercount >= 5) {
+        return mainrank + 4096 * 10; // 13 five of a kind
+    }
+
+    bool verbose = false;
+    if(debug.on && debug.verbose && IDin == debug.id) {
+        verbose = true;
+    }
+
+    if (jokercount) {
+        switch (numevalcards) {
+            case 5:
+                result = mutate5(wk, jokers, 0, verbose);
+                break;
+            case 6:
+                result = mutate6(wk, jokers, 0, verbose);
+                break;
+            case 7:
+                result = mutate7(wk, jokers, 0, verbose);
+                break;
+            default:
+                throw Error("Problem with numcards = " + std::to_string(numcards));
+        }
+    } else {
+        result = standard_lookup(wk, numevalcards);
+    }
+
+    if(debug.on && IDin == debug.id) {
+        if(!debug.eval_callback(IDin, result)) {
+            return -1;
+        }
+    }
+
+    return result;
+}
+
+void generate_standard(const std::string& file_name) {
+    int     IDslot, card = 0;
     int64_t ID;
 
     clock_t timer = clock(); // remember when I started
 
-    // Clear our arrays
-    memset(IDs, 0, sizeof(IDs));
-    memset(HR, 0, sizeof(HR));
+    std::vector<int> HR(STANDARD_HAND_RANKS_COUNT);
+    std::vector<int64_t> IDs(STANDARD_IDS_COUNT);
+
+    int     numIDs   = 1;
+    int     numcards = 0;
+    int     maxHR    = 0;
+    int64_t maxID    = 0;
 
     // step through the ID array - always shifting the current ID and
     // adding 52 cards to the end of the array.
     // when I am at 7 cards put the Hand Rank in!!
     // stepping through the ID array is perfect!!
+    // SA: indeed
 
     int IDnum;
-    int holdid;
 
     _PDEBUG("Getting Card IDs!");
 
@@ -348,36 +476,44 @@ void init() {
     // adds them to the end. I need this list to be stable when I set the
     // handranks (next set)  (I do the insertion sort on new IDs these)
     // so I had to get the IDs first and then set the handranks
+    // SA: will stop if there are no combinations left
     for (IDnum = 0; IDs[IDnum] || IDnum == 0; IDnum++) {
         // start at 1 so I have a zero catching entry (just in case)
-        for (card = 1; card < 53; card++) {
+        for (card = 1; card < STANDARD_DECK_SIZE + 1; card++) {
             // the ids above contain cards upto the current card.  Now add a new card
-            ID = make_id(IDs[IDnum], card); // get the new ID for it
+            ID = make_id(IDs[IDnum], card, numcards); // get the new ID for it
+            //count_jokercombs(ID, jokercombs);
             // and save it in the list if I am not on the 7th card
             if (numcards < 7)
-                holdid = save_id(ID);
+                save_id(ID, IDs, maxID, numIDs);
         }
-        _PPRINT("\rID - %d", IDnum); // show progress -- this counts up to 612976
+        // show progress -- this counts up to 612976
+        // SA: if there are jokers, counts up to ~1M
+        _PPRINT("\rID - %d %llX %llX", IDnum, ID, IDs[IDnum+1]);
     }
 
-    _PDEBUG("\nSetting HandRanks!");
+    _PDEBUG("\nSetting HandRanks! %d", IDnum);
 
     // this is as above, but will not add anything to the ID list, so it is stable
     for (IDnum = 0; IDs[IDnum] || IDnum == 0; IDnum++) {
         // start at 1 so I have a zero catching entry (just in case)
-        for (card = 1; card < 53; card++) {
-            ID = make_id(IDs[IDnum], card);
+        for (card = 1; card < STANDARD_DECK_SIZE + 1; card++) {
+            ID = make_id(IDs[IDnum], card, numcards);
 
             if (numcards < 7) {
                 // when in the index mode (< 7 cards) get the id to save
-                IDslot = save_id(ID) * 53 + 53;
-            } else {
+                IDslot = save_id(ID, IDs, maxID, numIDs) * (STANDARD_DECK_SIZE + 1) + STANDARD_DECK_SIZE + 1;
+            }
+            else {
                 // if I am at the 7th card, get the equivalence class ("hand rank") to save
-                IDslot = do_eval(ID);
+                IDslot = do_eval(ID, numcards);
             }
 
-            maxHR     = IDnum * 53 + card + 53; // find where to put it
-            HR[maxHR] = IDslot;                 // and save the pointer to the next card or the handrank
+            // find where to put it
+            maxHR     = IDnum * (STANDARD_DECK_SIZE + 1) + card + STANDARD_DECK_SIZE + 1;
+            // and save the pointer to the next card or the handrank
+            HR[maxHR] = IDslot;
+            //_PDEBUG("ID0 - %d %d", IDnum, maxHR); // show the progress -- counts to 612976 again
         }
 
         if (numcards == 6 || numcards == 7) {
@@ -385,7 +521,104 @@ void init() {
             // you can just do HR[u3] or HR[u4] from below code for Handrank of the 5 or
             // 6 card hand
             // this puts the above handrank into the array
-            HR[IDnum * 53 + 53] = do_eval(IDs[IDnum]);
+            HR[IDnum * (STANDARD_DECK_SIZE + 1) + STANDARD_DECK_SIZE + 1] = do_eval(IDs[IDnum], numcards);
+            //_PDEBUG("ID6 - %d %d", IDnum, IDnum * (DECK_SIZE + 1) + DECK_SIZE + 1); // show the progress -- counts to 612976 again
+        }
+
+        _PPRINT("\rID - %d", IDnum); // show the progress -- counts to 612976 again
+    }
+
+
+    _PDEBUG("\nNumber IDs = %d\nmaxHR = %d", numIDs, maxHR); // for warm fuzzys
+
+    timer = clock() - timer; // end the timer
+
+    _PDEBUG("Training seconds = %.2f", (float)timer / CLOCKS_PER_SEC);
+
+    FILE* fout = fopen(file_name.c_str(), "wb");
+    if (!fout) {
+        throw Error("Write to file failed: " + file_name);
+    }
+    std::fwrite(&HR[0], sizeof(int) * HR.size(), 1, fout);
+    fclose(fout);
+}
+
+void generate(const std::string& file_name) {
+    int     IDslot, card = 0;
+    int64_t ID;
+
+    clock_t timer = clock(); // remember when I started
+
+    std::vector<int> HR(JOKER_HAND_RANKS_COUNT);
+    std::vector<int64_t> IDs(JOKER_IDS_COUNT);
+
+    int     numIDs   = 1;
+    int     numcards = 0;
+    int     maxHR    = 0;
+    int64_t maxID    = 0;
+
+    // step through the ID array - always shifting the current ID and
+    // adding 52 cards to the end of the array.
+    // when I am at 7 cards put the Hand Rank in!!
+    // stepping through the ID array is perfect!!
+    // SA: indeed
+
+    int IDnum;
+
+    _PDEBUG("Getting Card IDs!");
+
+    // Jmd: Okay, this loop is going to fill up the IDs[] array which has
+    // 612,967 slots. as this loops through and find new combinations it
+    // adds them to the end. I need this list to be stable when I set the
+    // handranks (next set)  (I do the insertion sort on new IDs these)
+    // so I had to get the IDs first and then set the handranks
+    // SA: will stop if there are no combinations left
+    for (IDnum = 0; IDs[IDnum] || IDnum == 0; IDnum++) {
+        // start at 1 so I have a zero catching entry (just in case)
+        for (card = 1; card < JOKER_DECK_SIZE + 1; card++) {
+            // the ids above contain cards upto the current card.  Now add a new card
+            ID = make_id(IDs[IDnum], card, numcards, true); // get the new ID for it
+            //count_jokercombs(ID, jokercombs);
+            // and save it in the list if I am not on the 7th card
+            if (numcards < 7)
+                save_id(ID, IDs, maxID, numIDs);
+        }
+        // show progress -- this counts up to 612976
+        // SA: if there are jokers, counts up to ~1M
+        _PPRINT("\rID - %d %llX %llX", IDnum, ID, IDs[IDnum+1]);
+    }
+
+    _PDEBUG("\nSetting HandRanks! %d", IDnum);
+
+    // this is as above, but will not add anything to the ID list, so it is stable
+    for (IDnum = 0; IDs[IDnum] || IDnum == 0; IDnum++) {
+        // start at 1 so I have a zero catching entry (just in case)
+        for (card = 1; card < JOKER_DECK_SIZE + 1; card++) {
+            ID = make_id(IDs[IDnum], card, numcards, true);
+
+            if (numcards < 7) {
+                // when in the index mode (< 7 cards) get the id to save
+                IDslot = save_id(ID, IDs, maxID, numIDs) * (JOKER_DECK_SIZE + 1) + JOKER_DECK_SIZE + 1;
+            }
+            else {
+                // if I am at the 7th card, get the equivalence class ("hand rank") to save
+                IDslot = do_joker_eval(ID, numcards);
+            }
+
+            // find where to put it
+            maxHR     = IDnum * (JOKER_DECK_SIZE + 1) + card + JOKER_DECK_SIZE + 1;
+            // and save the pointer to the next card or the handrank
+            HR[maxHR] = IDslot;
+            //_PDEBUG("ID0 - %d %d", IDnum, maxHR); // show the progress -- counts to 612976 again
+        }
+
+        if (numcards == 6 || numcards == 7) {
+            // an extra, If you want to know what the handrank when there is 5 or 6 cards
+            // you can just do HR[u3] or HR[u4] from below code for Handrank of the 5 or
+            // 6 card hand
+            // this puts the above handrank into the array
+            HR[IDnum * (JOKER_DECK_SIZE + 1) + JOKER_DECK_SIZE + 1] = do_joker_eval(IDs[IDnum], numcards);
+            //_PDEBUG("ID6 - %d %d", IDnum, IDnum * (DECK_SIZE + 1) + DECK_SIZE + 1); // show the progress -- counts to 612976 again
         }
 
         _PPRINT("\rID - %d", IDnum); // show the progress -- counts to 612976 again
@@ -396,6 +629,58 @@ void init() {
     timer = clock() - timer; // end the timer
 
     _PDEBUG("Training seconds = %.2f", (float)timer / CLOCKS_PER_SEC);
+
+    FILE* fout = fopen(file_name.c_str(), "wb");
+    if (!fout) {
+        throw Error("Write to file failed: " + file_name);
+    }
+    std::fwrite(&HR[0], sizeof(int) * HR.size(), 1, fout);
+    fclose(fout);
+}
+
+void init() try {
+    std::string ranks_file_name = RANKS_FILE_NAME;
+
+    std::error_code error;
+    ranks_map.map(ranks_file_name, error);
+    if (!error) {
+        _PDEBUG("Mapped: %.*s", (int)ranks_file_name.length(), ranks_file_name.data());
+        return;
+    }
+
+    _PDEBUG("Generating new file: %.*s", (int)ranks_file_name.length(), ranks_file_name.data());
+
+    // use standard handranks as lookup service
+    std::string standard_ranks_file_name = STANDARD_RANKS_FILE_NAME;
+    standard_ranks_map.map(standard_ranks_file_name, error);
+    if (error) {
+        _PDEBUG("Generating new file: %.*s", (int)standard_ranks_file_name.length(), standard_ranks_file_name.data());
+        generate_standard(standard_ranks_file_name);
+        standard_ranks_map.map(standard_ranks_file_name, error);
+        if (error) {
+            throw Error("Map file failed");
+            abort();
+        }
+    }
+
+    _PDEBUG("Mapped: %.*s", (int)standard_ranks_file_name.length(), standard_ranks_file_name.data());
+
+    // can't mmap, generate new file
+    generate(ranks_file_name);
+
+    ranks_map.map(ranks_file_name, error);
+    if (error) {
+        throw Error("Map file failed");
+        abort();
+    }
+}
+catch(Error& e) {
+    fprintf(stderr, "Init failed: %s", e.what());
+    abort();
+}
+
+void fini() {
+    ranks_map.unmap();
 }
 
 //   This routine initializes the deck.  A deck of cards is
@@ -456,7 +741,6 @@ std::string print_hand(int* hand, int size) {
         else
             suit = 's';
 
-        _PDEBUG("card: %X - rank: %d suit: %d", hand[i], ranks[(hand[i] >> 8) & 0xF], suit);
         result.push_back(ranks[(hand[i] >> 8) & 0xF]);
         result.push_back(suit);
     }
@@ -475,7 +759,7 @@ unsigned find_fast(unsigned u) {
     return r;
 }
 
-int eval_5hand_fast(int c1, int c2, int c3, int c4, int c5) {
+int eval_5cards(int c1, int c2, int c3, int c4, int c5) {
     int q = (c1 | c2 | c3 | c4 | c5) >> 16;
 
     // check for flushes and straight flushes
@@ -490,39 +774,81 @@ int eval_5hand_fast(int c1, int c2, int c3, int c4, int c5) {
     return hash_values[find_fast((c1 & 0xFF) * (c2 & 0xFF) * (c3 & 0xFF) * (c4 & 0xFF) * (c5 & 0xFF))];
 }
 
-short eval_5hand(int* hand) {
+int eval_5hand(const int* hand) {
     int c1 = *hand++;
     int c2 = *hand++;
     int c3 = *hand++;
     int c4 = *hand++;
     int c5 = *hand;
-    return eval_5hand_fast(c1, c2, c3, c4, c5);
+    return eval_5cards(c1, c2, c3, c4, c5);
 }
 
-// This is a non-optimized method of determining the best five-card hand possible out of seven cards.
-short eval_7hand(int* hand) {
-    int best = 9999, subhand[5];
-    for (int i = 0; i < 21; i++) {
+// This is a non-optimized method of determining the best five-card hand possible out of six cards.
+// If 6 cards I would like to find Result for them
+// Cactus Key is 1 = highest - 7362 lowest
+// I need to get the min for the permutations
+int eval_6hand(const int* hand) {
+    int subhand[5];
+    int best = 9999;
+    //std::atomic<int> best;
+    //best = 9999;
+    //tbb::parallel_for(0, 6, [&](int i){
+    for (int i = 0; i < 6; i++) {
+        //int subhand[5];
         for (int j = 0; j < 5; j++)
-            subhand[j] = hand[perm7[i][j]];
-        int q = eval_5hand(subhand);
-        if (q < best)
-            best = q;
+            subhand[j] = hand[perm6[i][j]];
+        best = std::min(best, eval_5hand(subhand));
     }
     return best;
 }
 
-// Lookup of a 7-card poker hand, cards should be a pointer to an array
-// of 7 integers each with value between 1 and 52 inclusive.
-int lookup(const int* cards) {
-    int p;
-    p = HR[53 + cards[0]];
-    p = HR[p + cards[1]];
-    p = HR[p + cards[2]];
-    p = HR[p + cards[3]];
-    p = HR[p + cards[4]];
-    p = HR[p + cards[5]];
-    p = HR[p + cards[6]];
+// This is a non-optimized method of determining the best five-card hand possible out of seven cards.
+int eval_7hand(const int* hand) {
+    int subhand[5];
+    int best = 9999;
+    //std::atomic<int> best;
+    //best = 9999;
+    //tbb::parallel_for(0, 21, [&](int i){
+        //int subhand[5];
+    for (int i = 0; i < 21; i++) {
+        for (int j = 0; j < 5; j++)
+            subhand[j] = hand[perm7[i][j]];
+        best = std::min(best, eval_5hand(subhand));
+    }
+    return best;
+}
+
+// Lookup of a poker hand, cards should be a pointer to an array
+// of integers each with value between 1 and DECK_SIZE inclusive.
+int standard_lookup(const int* cards, int size) {
+    const int* ranks = reinterpret_cast<const int*>(standard_ranks_map.data());
+
+    int p = STANDARD_DECK_SIZE + 1;
+    for (int i = 0; i < size; ++i) {
+        p = ranks[p + cards[i]];
+    }
+
+    if (size == 5 || size == 6) {
+        p = ranks[p];
+    }
+
+    return p;
+}
+
+// Lookup of a poker hand, cards should be a pointer to an array
+// of integers each with value between 1 and DECK_SIZE inclusive.
+int lookup(const int* cards, int size) {
+    const int* ranks = reinterpret_cast<const int*>(ranks_map.data());
+
+    int p = JOKER_DECK_SIZE + 1;
+    for (int i = 0; i < size; ++i) {
+        p = ranks[p + cards[i]];
+    }
+
+    if (size == 5 || size == 6) {
+        p = ranks[p];
+    }
+
     return p;
 }
 
